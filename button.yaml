@@ -1,0 +1,172 @@
+esphome:
+  name: button001
+  on_boot:
+    priority: -10
+    then:
+      - script.execute: publish_state
+
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: arduino
+    version: latest
+  
+
+logger:
+
+ota:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  
+  manual_ip:
+    static_ip: 192.168.1.237
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+   
+
+  ap:
+    ssid: !secret hotspot_ssid
+    password: !secret hotspot_password
+
+captive_portal:
+
+deep_sleep:
+  id: deep_sleep_1
+  wakeup_pin: GPIO25
+  wakeup_pin_mode: INVERT_WAKEUP
+
+
+
+
+globals:
+  - id: button_state
+    type: std::string     # Ez a gomb MQTT payload változója
+    restore_value: no
+    initial_value: ""  
+
+
+
+
+mqtt:
+  broker: !secret mqtt_server
+  username: button001
+  password: !secret mqtt_password
+  discovery: true
+  birth_message:
+    topic: buttons/available/button001
+    payload: online
+    qos: 1
+  will_message:
+    topic: buttons/available/button001
+    payload: offline
+    qos: 1
+  
+  on_message:
+    - topic: button001/ota_mode
+      payload: 'ON'
+      then:
+        - deep_sleep.prevent: deep_sleep_1
+    - topic: button001/sleep_mode
+      payload: 'ON'
+      then:
+        - deep_sleep.enter: deep_sleep_1
+
+# Ezzel a belső szenzorral figyeljük a lenyomott kombinációt
+binary_sensor:                         
+  - platform: gpio                     
+    pin:                               
+      number: GPIO25                    
+      mode: INPUT_PULLUP              
+      inverted: True                  
+    name: "Fali Kapcsolo Nappali"
+    internal: true
+    publish_initial_state: true                     
+    id: raw_switch_state 
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms            
+    on_multi_click:
+    - timing:
+        - ON for at most 1s
+        - OFF for at most 0.5s
+        - ON for at most 1s
+        - OFF for at least 0.1s
+      then:
+        - logger.log: "Double Clicked"
+        - lambda: |-                          # Gomb payload változó új értéket kap
+            id(button_state) = "double";  
+        - script.execute: publish_state
+
+    - timing:
+        - ON for at most 1s
+        - OFF for at most 0.5s
+        - ON for at most 1s
+        - OFF for at most 0.5s
+        - ON for at most 1s
+        - OFF for at least 0.1s
+      then:
+        - logger.log: "Triple Clicked"
+        - lambda: |-                          # Gomb payload változó új értéket kap
+            id(button_state) = "triple";
+        - script.execute: publish_state
+
+    - timing:
+        - ON for at least 1s
+      then:
+        - logger.log: "Hold Clicked"
+        - lambda: |-                          # Gomb payload változó új értéket kap
+            id(button_state) = "hold";
+        - script.execute: publish_state
+
+    - timing:
+        - ON for at most 1s
+        - OFF for at least 0.5s
+      then:
+        - logger.log: "Single Short Clicked"
+        - lambda: |-                          # Gomb payload változó új értéket kap
+            id(button_state) = "single";
+        - script.execute: publish_state
+
+
+# Ezzel a belső szenzorral figyeljük raw_switch_state szenzor OFF állapotát. Ha 8s -ig folyamatosan OFF elmegyünk aludni. Ha közben
+# újra gombot nyomunk, 8s is újra indul.
+  - platform: template
+    name: "timer"
+    id: timer
+    internal: true
+    filters:
+      - delayed_off: 8s                       # Ennyi tétlen idő után megyünk aludni
+    lambda: !lambda |-
+      if (id(raw_switch_state).state) {
+        id(timer).publish_state(true);
+        return {};
+      } else {
+        id(timer).publish_state(false);
+        return {};
+      }
+    on_state:
+      then:
+        - if:
+            condition:
+              binary_sensor.is_off: timer
+            then:
+              - mqtt.publish:
+                  topic: buttons/available/button001
+                  payload: offline
+                  qos: 1
+              - deep_sleep.enter: deep_sleep_1
+
+        
+script:           
+  - id: publish_state                          # MQTT szerveren publikáljuk gomb új értékét
+    then:
+      - mqtt.publish:
+                  topic: button001/sensor/bedside_button/state
+                  payload: !lambda |-
+                    return id(button_state);
+                  qos: 1
+
